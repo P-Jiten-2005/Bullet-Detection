@@ -1,0 +1,28 @@
+{
+  "name": "ISSF 10m Air Rifle",
+  "width_mm": 80.0,
+  "height_mm": 80.0,
+  "bullet_compatibility": ["5.56", "7.62", "9.0"],
+  "decimal_scoring_supported": true,
+  "ring_spacing_mm": 2.5,
+  "bullseyes": [
+    {
+      "id": 1,
+      "center_x_mm": 40.0,
+      "center_y_mm": 40.0,
+      "scoring_rule": "inward",
+      "rings": [
+        {"value": 1, "outer_radius_mm": 22.75},
+        {"value": 2, "outer_radius_mm": 20.25},
+        {"value": 3, "outer_radius_mm": 17.75},
+        {"value": 4, "outer_radius_mm": 15.25},
+        {"value": 5, "outer_radius_mm": 12.75},
+        {"value": 6, "outer_radius_mm": 10.25},
+        {"value": 7, "outer_radius_mm": 7.75},
+        {"value": 8, "outer_radius_mm": 5.25},
+        {"value": 9, "outer_radius_mm": 2.75},
+        {"value": 10, "outer_radius_mm": 0.25}
+      ]
+    }
+  ]
+}

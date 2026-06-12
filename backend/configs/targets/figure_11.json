@@ -1,0 +1,45 @@
+{
+  "name": "figure 11",
+  "width_mm": 210,
+  "height_mm": 296,
+  "bullet_compatibility": [
+    "5.56",
+    "7.62",
+    "9.0"
+  ],
+  "decimal_scoring_supported": true,
+  "ring_spacing_mm": 2.5,
+  "tag_size_mm": 24,
+  "tag_margin_mm": 20,
+  "bullseyes": [],
+  "scoring_regions": [
+    {
+      "id": 1,
+      "name": "Zone 1",
+      "value": 5,
+      "x_min_mm": 93.2,
+      "y_min_mm": 122.4,
+      "x_max_mm": 121.3,
+      "y_max_mm": 172.5
+    },
+    {
+      "id": 2,
+      "name": "Zone 2",
+      "value": 4,
+      "x_min_mm": 84.7,
+      "y_min_mm": 106.9,
+      "x_max_mm": 129.8,
+      "y_max_mm": 185.2
+    },
+    {
+      "id": 3,
+      "name": "Zone 3",
+      "value": 3,
+      "x_min_mm": 75.5,
+      "y_min_mm": 94.2,
+      "x_max_mm": 139.7,
+      "y_max_mm": 199.2
+    }
+  ],
+  "preview_url": "/static/uploads/target_preview_figure_11.png"
+}
