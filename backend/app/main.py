@@ -183,6 +183,51 @@ def get_target_corners(baseline_path: Optional[str], session_id: str) -> np.ndar
 
     return np.array([[0, 0], [999, 0], [999, 999], [0, 999]], dtype=np.float32)
 
+def get_static_baseline_corners(baseline_path: Optional[str], session_id: str, target: Any) -> np.ndarray:
+    """
+    Detects/calculates target corners on the static baseline image specifically,
+    without falling back/reusing the camera_service's dynamic calibration corners.
+    """
+    if baseline_path and os.path.exists(baseline_path):
+        try:
+            baseline_img = cv2.imread(baseline_path)
+            if baseline_img is not None:
+                from app.services.apriltag_service import apriltag_service
+                _, corners, tags = apriltag_service.detect_and_warp(
+                    baseline_img,
+                    tag_size_mm=target.tag_size_mm,
+                    tag_margin_mm=target.tag_margin_mm,
+                    target_width_mm=target.width_mm,
+                    target_height_mm=target.height_mm
+                )
+                if corners is not None and len(tags) >= apriltag_service.min_tags:
+                    return np.array(corners, dtype=np.float32)
+
+                # Try Paper Contour
+                pts = camera_service._find_paper_contour(baseline_img)
+                if pts is not None:
+                    rect = np.zeros((4, 2), dtype="float32")
+                    s = pts.sum(axis=1)
+                    rect[0] = pts[np.argmin(s)]
+                    rect[2] = pts[np.argmax(s)]
+                    diff = np.diff(pts, axis=1)
+                    rect[1] = pts[np.argmin(diff)]
+                    rect[3] = pts[np.argmax(diff)]
+                    return rect
+        except Exception as e:
+            logger.warning(f"Failed to detect static baseline corners: {e}")
+
+    # Fallback to full image size
+    if baseline_path and os.path.exists(baseline_path):
+        try:
+            img = cv2.imread(baseline_path)
+            if img is not None:
+                h, w = img.shape[:2]
+                return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+        except Exception:
+            pass
+    return np.array([[0, 0], [999, 0], [999, 999], [0, 999]], dtype=np.float32)
+
 def load_target_definition(target_type: str) -> TargetDefinition:
     filename = f"{target_type}.json"
     file_path = os.path.join(backend_root, "configs", "targets", filename)
@@ -202,10 +247,28 @@ def score_shot_record(
     shot.x_calibrated = x_mm
     shot.y_calibrated = y_mm
 
-    # Scale caliber diameter from pixels to millimeters based on local pixel-to-mm scaling
-    x_offset_mm, y_offset_mm = transformer.raw_pixel_to_target_mm(shot.x_raw + (shot.diameter_px / 2.0), shot.y_raw)
-    local_radius_mm = np.sqrt((x_offset_mm - x_mm)**2 + (y_offset_mm - y_mm)**2)
-    shot.diameter_mm = local_radius_mm * 2.0
+    # Project contour points to mm space and calculate physical equivalent diameter
+    if detection_dict is not None and "raw_contour" in detection_dict and detection_dict["raw_contour"] is not None:
+        try:
+            contour_mm = []
+            for pt in detection_dict["raw_contour"]:
+                mx, my = transformer.raw_pixel_to_target_mm(float(pt[0]), float(pt[1]))
+                contour_mm.append([mx, my])
+            contour_mm_arr = np.array(contour_mm, dtype=np.float32)
+            # Compute contour area in mm^2
+            area_mm = cv2.contourArea(contour_mm_arr)
+            # Calculate equivalent circular diameter from mm-space area
+            shot.diameter_mm = float(np.sqrt(4.0 * area_mm / np.pi))
+        except Exception as e:
+            logger.warning(f"Failed to calculate mm-space contour area, falling back: {e}")
+            x_offset_mm, y_offset_mm = transformer.raw_pixel_to_target_mm(shot.x_raw + (shot.diameter_px / 2.0), shot.y_raw)
+            local_radius_mm = np.sqrt((x_offset_mm - x_mm)**2 + (y_offset_mm - y_mm)**2)
+            shot.diameter_mm = local_radius_mm * 2.0
+    else:
+        # Fallback to local scale estimate
+        x_offset_mm, y_offset_mm = transformer.raw_pixel_to_target_mm(shot.x_raw + (shot.diameter_px / 2.0), shot.y_raw)
+        local_radius_mm = np.sqrt((x_offset_mm - x_mm)**2 + (y_offset_mm - y_mm)**2)
+        shot.diameter_mm = local_radius_mm * 2.0
 
     # Calculate localization error
     if detection_dict is not None:
@@ -653,7 +716,13 @@ async def run_detection(
         select(models.Shot).where(models.Shot.session_id == session_id)
     )
     existing_shots = [
-        {"x_raw": s.x_raw, "y_raw": s.y_raw, "diameter_px": s.diameter_px} 
+        {
+            "x_raw": s.x_raw,
+            "y_raw": s.y_raw,
+            "diameter_px": s.diameter_px,
+            "x_calibrated": s.x_calibrated,
+            "y_calibrated": s.y_calibrated
+        } 
         for s in shots_result.scalars().all()
     ]
 
@@ -665,11 +734,44 @@ async def run_detection(
 
     # 5. Build Coordinate Transformer and run CV Engine Detection
     target = load_target_definition(session.target_type)
-    corners_pixel = get_target_corners(baseline_path, session_id)
+    
+    # Try to detect tags on the current uploaded frame to compute a fresh homography
+    try:
+        curr_img = cv2.imread(capture_image.file_path)
+        if curr_img is not None:
+            from app.services.apriltag_service import apriltag_service
+            _, current_corners, tags = apriltag_service.detect_and_warp(
+                curr_img,
+                tag_size_mm=target.tag_size_mm,
+                tag_margin_mm=target.tag_margin_mm,
+                target_width_mm=target.width_mm,
+                target_height_mm=target.height_mm
+            )
+            if current_corners is not None and len(tags) >= apriltag_service.min_tags:
+                corners_pixel = current_corners
+                logger.info("Successfully detected AprilTags on current uploaded frame for dynamic homography.")
+            else:
+                corners_pixel = get_target_corners(baseline_path, session_id)
+        else:
+            corners_pixel = get_target_corners(baseline_path, session_id)
+    except Exception as e:
+        logger.warning(f"Failed to detect tags on uploaded frame, falling back: {e}")
+        corners_pixel = get_target_corners(baseline_path, session_id)
+
     target = get_adjusted_target_definition(target, baseline_path, corners_pixel)
 
     transformer = CoordinateTransformer(
         corners_pixel=corners_pixel,
+        target_width_mm=target.width_mm,
+        target_height_mm=target.height_mm,
+        warped_width_px=1000.0,
+        warped_height_px=1000.0
+    )
+
+    # Build baseline transformer for mapping current-frame coordinates to baseline frame
+    baseline_corners = get_static_baseline_corners(baseline_path, session_id, target)
+    transformer_baseline = CoordinateTransformer(
+        corners_pixel=baseline_corners,
         target_width_mm=target.width_mm,
         target_height_mm=target.height_mm,
         warped_width_px=1000.0,
@@ -722,6 +824,49 @@ async def run_detection(
             weighted_x_raw=detection["weighted_x_raw"],
             weighted_y_raw=detection["weighted_y_raw"]
         )
+
+        # Project raw shot coordinates back to static baseline pixel space for database/display consistency
+        try:
+            x_mm, y_mm = new_shot.x_calibrated, new_shot.y_calibrated
+            x_base, y_base = transformer_baseline.target_mm_to_raw_pixel(x_mm, y_mm)
+            new_shot.x_raw = float(x_base)
+            new_shot.y_raw = float(y_base)
+
+            # centroid
+            cx_mm, cy_mm = transformer.raw_pixel_to_target_mm(detection["centroid_x_raw"], detection["centroid_y_raw"])
+            cb_x, cb_y = transformer_baseline.target_mm_to_raw_pixel(cx_mm, cy_mm)
+            new_detection_record.centroid_x_raw = float(cb_x)
+            new_detection_record.centroid_y_raw = float(cb_y)
+
+            # ellipse
+            ex_mm, ey_mm = transformer.raw_pixel_to_target_mm(detection["ellipse_x_raw"], detection["ellipse_y_raw"])
+            eb_x, eb_y = transformer_baseline.target_mm_to_raw_pixel(ex_mm, ey_mm)
+            new_detection_record.ellipse_x_raw = float(eb_x)
+            new_detection_record.ellipse_y_raw = float(eb_y)
+
+            # caliber
+            cal_x_mm, cal_y_mm = transformer.raw_pixel_to_target_mm(detection["caliber_x_raw"], detection["caliber_y_raw"])
+            calb_x, calb_y = transformer_baseline.target_mm_to_raw_pixel(cal_x_mm, cal_y_mm)
+            new_detection_record.caliber_x_raw = float(calb_x)
+            new_detection_record.caliber_y_raw = float(calb_y)
+
+            # weighted
+            w_mm_x, w_mm_y = transformer.raw_pixel_to_target_mm(detection["weighted_x_raw"], detection["weighted_y_raw"])
+            wb_x, wb_y = transformer_baseline.target_mm_to_raw_pixel(w_mm_x, w_mm_y)
+            new_detection_record.weighted_x_raw = float(wb_x)
+            new_detection_record.weighted_y_raw = float(wb_y)
+
+            # raw_contour
+            if detection.get("raw_contour") is not None:
+                raw_contour_base = []
+                for pt in detection["raw_contour"]:
+                    pt_mm_x, pt_mm_y = transformer.raw_pixel_to_target_mm(float(pt[0]), float(pt[1]))
+                    pt_base_x, pt_base_y = transformer_baseline.target_mm_to_raw_pixel(pt_mm_x, pt_mm_y)
+                    raw_contour_base.append([float(pt_base_x), float(pt_base_y)])
+                new_detection_record.raw_contour = raw_contour_base
+        except Exception as e:
+            logger.warning(f"Failed to map detection coords back to baseline in run_detection: {e}")
+
         db.add(new_detection_record)
         
         # Keep reference to shape contour in response payload
@@ -1259,7 +1404,13 @@ async def fire_shot(session_id: str, db: AsyncSession = Depends(get_db)):
         select(models.Shot).where(models.Shot.session_id == session_id)
     )
     existing_shots = [
-        {"x_raw": s.x_raw, "y_raw": s.y_raw, "diameter_px": s.diameter_px} 
+        {
+            "x_raw": s.x_raw,
+            "y_raw": s.y_raw,
+            "diameter_px": s.diameter_px,
+            "x_calibrated": s.x_calibrated,
+            "y_calibrated": s.y_calibrated
+        } 
         for s in shots_res.scalars().all()
     ]
 
@@ -1275,11 +1426,39 @@ async def fire_shot(session_id: str, db: AsyncSession = Depends(get_db)):
     target = load_target_definition(session.target_type if session else "figure_eleven")
 
     # Build Coordinate Transformer
-    corners_pixel = get_target_corners(baseline_path, session_id)
+    # Try to detect tags on the current frame to compute a fresh homography
+    try:
+        from app.services.apriltag_service import apriltag_service
+        _, current_corners, tags = apriltag_service.detect_and_warp(
+            frame,
+            tag_size_mm=target.tag_size_mm,
+            tag_margin_mm=target.tag_margin_mm,
+            target_width_mm=target.width_mm,
+            target_height_mm=target.height_mm
+        )
+        if current_corners is not None and len(tags) >= apriltag_service.min_tags:
+            corners_pixel = current_corners
+            logger.info("Successfully detected AprilTags on current camera frame for dynamic homography.")
+        else:
+            corners_pixel = get_target_corners(baseline_path, session_id)
+    except Exception as e:
+        logger.warning(f"Failed to detect tags on current camera frame, falling back: {e}")
+        corners_pixel = get_target_corners(baseline_path, session_id)
+
     target = get_adjusted_target_definition(target, baseline_path, corners_pixel)
 
     transformer = CoordinateTransformer(
         corners_pixel=corners_pixel,
+        target_width_mm=target.width_mm,
+        target_height_mm=target.height_mm,
+        warped_width_px=1000.0,
+        warped_height_px=1000.0
+    )
+
+    # Build baseline transformer for mapping current-frame coordinates to baseline frame
+    baseline_corners = get_static_baseline_corners(baseline_path, session_id, target)
+    transformer_baseline = CoordinateTransformer(
+        corners_pixel=baseline_corners,
         target_width_mm=target.width_mm,
         target_height_mm=target.height_mm,
         warped_width_px=1000.0,
@@ -1334,6 +1513,50 @@ async def fire_shot(session_id: str, db: AsyncSession = Depends(get_db)):
             weighted_x_raw=hole["weighted_x_raw"],
             weighted_y_raw=hole["weighted_y_raw"]
         )
+
+        # Project raw shot coordinates back to static baseline pixel space for database/display consistency
+        try:
+            x_mm, y_mm = new_shot.x_calibrated, new_shot.y_calibrated
+            if x_mm is not None and y_mm is not None:
+                x_base, y_base = transformer_baseline.target_mm_to_raw_pixel(x_mm, y_mm)
+                new_shot.x_raw = float(x_base)
+                new_shot.y_raw = float(y_base)
+
+                # centroid
+                cx_mm, cy_mm = transformer.raw_pixel_to_target_mm(hole["centroid_x_raw"], hole["centroid_y_raw"])
+                cb_x, cb_y = transformer_baseline.target_mm_to_raw_pixel(cx_mm, cy_mm)
+                new_det.centroid_x_raw = float(cb_x)
+                new_det.centroid_y_raw = float(cb_y)
+
+                # ellipse
+                ex_mm, ey_mm = transformer.raw_pixel_to_target_mm(hole["ellipse_x_raw"], hole["ellipse_y_raw"])
+                eb_x, eb_y = transformer_baseline.target_mm_to_raw_pixel(ex_mm, ey_mm)
+                new_det.ellipse_x_raw = float(eb_x)
+                new_det.ellipse_y_raw = float(eb_y)
+
+                # caliber
+                cal_x_mm, cal_y_mm = transformer.raw_pixel_to_target_mm(hole["caliber_x_raw"], hole["caliber_y_raw"])
+                calb_x, calb_y = transformer_baseline.target_mm_to_raw_pixel(cal_x_mm, cal_y_mm)
+                new_det.caliber_x_raw = float(calb_x)
+                new_det.caliber_y_raw = float(calb_y)
+
+                # weighted
+                w_mm_x, w_mm_y = transformer.raw_pixel_to_target_mm(hole["weighted_x_raw"], hole["weighted_y_raw"])
+                wb_x, wb_y = transformer_baseline.target_mm_to_raw_pixel(w_mm_x, w_mm_y)
+                new_det.weighted_x_raw = float(wb_x)
+                new_det.weighted_y_raw = float(wb_y)
+
+                # raw_contour
+                if hole.get("raw_contour") is not None:
+                    raw_contour_base = []
+                    for pt in hole["raw_contour"]:
+                        pt_mm_x, pt_mm_y = transformer.raw_pixel_to_target_mm(float(pt[0]), float(pt[1]))
+                        pt_base_x, pt_base_y = transformer_baseline.target_mm_to_raw_pixel(pt_mm_x, pt_mm_y)
+                        raw_contour_base.append([float(pt_base_x), float(pt_base_y)])
+                    new_det.raw_contour = raw_contour_base
+        except Exception as e:
+            logger.warning(f"Failed to map detection coords back to baseline in fire_shot: {e}")
+
         db.add(new_det)
         new_shots_saved.append((new_shot, new_det))
 

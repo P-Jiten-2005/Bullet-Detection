@@ -160,18 +160,94 @@ class CameraService:
                 continue
             logger.info("Auto-pipeline: calibration succeeded. Ready for rounds.")
 
+    def _get_target_for_active_session(self) -> Tuple[Optional[any], float, float, float, float, str]:
+        """
+        Synchronously retrieves session parameters and loads target definition from configs.
+        Returns (target, target_width_mm, target_height_mm, tag_size_mm, tag_margin_mm, target_type)
+        """
+        session_id = self.active_session_id
+        target_width_mm = 210.0
+        target_height_mm = 297.0
+        tag_size_mm = 15.0
+        tag_margin_mm = 20.0
+        target_type = "figure_eleven"
+        target = None
+
+        if session_id:
+            paths = [
+                "./data/target_analysis.db",
+                "../../data/target_analysis.db",
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "target_analysis.db")
+            ]
+            for db_path in paths:
+                if os.path.exists(db_path):
+                    try:
+                        import sqlite3
+                        conn = sqlite3.connect(db_path)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT target_type FROM sessions WHERE id = ?", (session_id,))
+                        row = cursor.fetchone()
+                        conn.close()
+                        if row:
+                            target_type = row[0]
+                            break
+                    except Exception:
+                        pass
+            try:
+                from app.main import load_target_definition
+                target = load_target_definition(target_type)
+                target_width_mm = target.width_mm
+                target_height_mm = target.height_mm
+                tag_size_mm = target.tag_size_mm
+                tag_margin_mm = target.tag_margin_mm
+            except Exception:
+                pass
+        return target, target_width_mm, target_height_mm, tag_size_mm, tag_margin_mm, target_type
+
     def get_latest_frame_jpeg(self) -> Optional[bytes]:
         with self.lock:
             if self.current_frame is None:
                 return None
             # Draw crosshairs/bounding markers on the preview if calibrated
             preview_frame = self.current_frame.copy()
-            if self.is_calibrated:
-                # Highlight calibration status
-                cv2.putText(preview_frame, "CALIBRATED FEED", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # Dynamic target overlay registration (Phase 5)
+            target, target_width_mm, target_height_mm, tag_size_mm, tag_margin_mm, target_type = self._get_target_for_active_session()
+            
+            if target is not None:
+                try:
+                    # Detect AprilTags dynamically on the current frame
+                    from app.services.apriltag_service import apriltag_service
+                    warped, corners, tags = apriltag_service.detect_and_warp(
+                        preview_frame,
+                        tag_size_mm=tag_size_mm,
+                        tag_margin_mm=tag_margin_mm,
+                        target_width_mm=target_width_mm,
+                        target_height_mm=target_height_mm
+                    )
+                    if warped is not None and len(tags) >= apriltag_service.min_tags:
+                        # Draw zones dynamically using the detected corners
+                        preview_frame = draw_zones_on_image(preview_frame, corners, target)
+                        # Dynamically update calibration parameters
+                        self.corners_pixel = corners
+                        self.is_calibrated = True
+                        cv2.putText(preview_frame, "DYNAMIC OVERLAY ACTIVE", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    else:
+                        # Fallback to drawing zones using static corners if calibrated
+                        if self.is_calibrated and self.corners_pixel is not None:
+                            preview_frame = draw_zones_on_image(preview_frame, self.corners_pixel, target)
+                            cv2.putText(preview_frame, "OVERLAY STATIC FALLBACK", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                        else:
+                            cv2.putText(preview_frame, "ALIGNING TARGET...", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                except Exception as e:
+                    logger.warning(f"Dynamic overlay registration failed: {e}")
+                    cv2.putText(preview_frame, "OVERLAY ERROR", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             else:
-                cv2.putText(preview_frame, "UNCONNECTED FEED - PLACE TARGET", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
+                if self.is_calibrated:
+                    cv2.putText(preview_frame, "CALIBRATED FEED", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                else:
+                    cv2.putText(preview_frame, "UNCONNECTED FEED - PLACE TARGET", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
             ret, jpeg = cv2.imencode('.jpg', preview_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
             return jpeg.tobytes() if ret else None
 
@@ -828,10 +904,23 @@ def generate_rectified_debug_image(
             shot_number = shot.shot_number if hasattr(shot, "shot_number") else shot.get("shot_number", 1)
             is_valid = shot.is_valid if hasattr(shot, "is_valid") else shot.get("is_valid", True)
             
-            wx, wy = transformer.raw_pixel_to_warped_pixel(x_raw, y_raw)
-            wx2, wy2 = transformer.raw_pixel_to_warped_pixel(x_raw + diameter_px, y_raw)
-            wd_px = int(np.sqrt((wx2 - wx)**2 + (wy2 - wy)**2))
-            wr_px = max(4, wd_px // 2)
+            x_calib = shot.x_calibrated if hasattr(shot, "x_calibrated") else shot.get("x_calibrated")
+            y_calib = shot.y_calibrated if hasattr(shot, "y_calibrated") else shot.get("y_calibrated")
+            diameter_mm = shot.diameter_mm if hasattr(shot, "diameter_mm") else shot.get("diameter_mm")
+            
+            if x_calib is not None and y_calib is not None:
+                wx, wy = transformer.target_mm_to_warped_pixel(x_calib, y_calib)
+                if diameter_mm is not None:
+                    wd_px = diameter_mm * (transformer.warped_width_px / transformer.target_width_mm)
+                else:
+                    wx2, wy2 = transformer.raw_pixel_to_warped_pixel(x_raw + diameter_px, y_raw)
+                    wd_px = int(np.sqrt((wx2 - wx)**2 + (wy2 - wy)**2))
+            else:
+                wx, wy = transformer.raw_pixel_to_warped_pixel(x_raw, y_raw)
+                wx2, wy2 = transformer.raw_pixel_to_warped_pixel(x_raw + diameter_px, y_raw)
+                wd_px = int(np.sqrt((wx2 - wx)**2 + (wy2 - wy)**2))
+                
+            wr_px = max(4, int(wd_px // 2))
 
             color = (0, 255, 0) if is_valid else (128, 128, 128)
             cv2.circle(warped_img, (int(wx), int(wy)), wr_px, color, 2)

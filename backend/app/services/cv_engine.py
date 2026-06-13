@@ -127,14 +127,16 @@ class CVEngine:
         if baseline_img is None or current_img is None:
             raise ValueError("Failed to load baseline or current image from disk.")
 
-        # Step 1: Align current image to baseline if requested
+        # Step 1: Align baseline image to current if requested (preserves current frame zoom/resolution)
         if align:
-            aligned_current = self.align_images(baseline_img, current_img)
+            aligned_baseline = self.align_images(current_img, baseline_img)
         else:
-            aligned_current = current_img
+            aligned_baseline = baseline_img
+
+        aligned_current = current_img
 
         # Step 2: Grayscale and Blur
-        gray_base = cv2.cvtColor(baseline_img, cv2.COLOR_BGR2GRAY)
+        gray_base = cv2.cvtColor(aligned_baseline, cv2.COLOR_BGR2GRAY)
         gray_curr = cv2.cvtColor(aligned_current, cv2.COLOR_BGR2GRAY)
         
         blur_base = cv2.GaussianBlur(gray_base, (5, 5), 0)
@@ -256,47 +258,56 @@ class CVEngine:
             else:
                 ellipse_x, ellipse_y = centroid_x, centroid_y
 
-            # Caliber-Constrained Circle Fit (Method 3) via custom 2D gradient descent
-            if transformer is not None and bullet_caliber_mm > 0:
-                try:
-                    x_mm, y_mm = transformer.raw_pixel_to_target_mm(centroid_x, centroid_y)
-                    x_offset_mm, y_offset_mm = transformer.raw_pixel_to_target_mm(centroid_x + 1.0, centroid_y)
-                    mm_per_pixel = np.sqrt((x_offset_mm - x_mm)**2 + (y_offset_mm - y_mm)**2)
-                    if mm_per_pixel > 0:
-                        caliber_radius_px = (bullet_caliber_mm / 2.0) / mm_per_pixel
-                    else:
-                        caliber_radius_px = equiv_diameter / 2.0
-                except Exception:
-                    caliber_radius_px = equiv_diameter / 2.0
-            else:
-                caliber_radius_px = equiv_diameter / 2.0
-
+            # Caliber-Constrained Circle Fit (Method 3) via custom 2D gradient descent in target-space mm
             contour_pts = c.reshape(-1, 2)
-            caliber_x, caliber_y = centroid_x, centroid_y
             N_pts = len(contour_pts)
-            if N_pts > 0:
-                alpha = 0.2
-                for _ in range(30):
-                    grad_x = 0.0
-                    grad_y = 0.0
+            
+            if transformer is not None and N_pts > 0 and bullet_caliber_mm > 0:
+                try:
+                    # 1. Transform initial center to target mm space
+                    x_mm, y_mm = transformer.raw_pixel_to_target_mm(centroid_x, centroid_y)
+                    
+                    # 2. Transform all contour points to target mm space
+                    contour_pts_mm = []
                     for pt in contour_pts:
-                        px, py = pt[0], pt[1]
-                        dx = px - caliber_x
-                        dy = py - caliber_y
-                        dist = np.sqrt(dx*dx + dy*dy)
-                        if dist > 0.01:
-                            factor = 1.0 - (caliber_radius_px / dist)
-                            grad_x += factor * (-dx)
-                            grad_y += factor * (-dy)
-                        else:
-                            grad_x += -caliber_radius_px
-                            grad_y += -caliber_radius_px
+                        mx, my = transformer.raw_pixel_to_target_mm(float(pt[0]), float(pt[1]))
+                        contour_pts_mm.append([mx, my])
+                    contour_pts_mm = np.array(contour_pts_mm, dtype=np.float32)
                     
-                    grad_x = (2.0 / N_pts) * grad_x
-                    grad_y = (2.0 / N_pts) * grad_y
+                    # 3. Fit caliber circle in target millimeter space using gradient descent
+                    bullet_radius_mm = bullet_caliber_mm / 2.0
+                    caliber_x_mm, caliber_y_mm = x_mm, y_mm
+                    alpha = 0.2
                     
-                    caliber_x -= alpha * grad_x
-                    caliber_y -= alpha * grad_y
+                    for _ in range(30):
+                        grad_x = 0.0
+                        grad_y = 0.0
+                        for pt_mm in contour_pts_mm:
+                            px_mm, py_mm = pt_mm[0], pt_mm[1]
+                            dx = px_mm - caliber_x_mm
+                            dy = py_mm - caliber_y_mm
+                            dist = np.sqrt(dx*dx + dy*dy)
+                            if dist > 0.01:
+                                factor = 1.0 - (bullet_radius_mm / dist)
+                                grad_x += factor * (-dx)
+                                grad_y += factor * (-dy)
+                            else:
+                                grad_x += -bullet_radius_mm
+                                grad_y += -bullet_radius_mm
+                        
+                        grad_x = (2.0 / N_pts) * grad_x
+                        grad_y = (2.0 / N_pts) * grad_y
+                        
+                        caliber_x_mm -= alpha * grad_x
+                        caliber_y_mm -= alpha * grad_y
+                        
+                    # 4. Map the optimized center back to raw pixel space for DB compatibility
+                    caliber_x, caliber_y = transformer.target_mm_to_raw_pixel(caliber_x_mm, caliber_y_mm)
+                except Exception as e:
+                    logger.warning(f"Millimeter caliber fit failed, falling back to pixel centroid: {e}")
+                    caliber_x, caliber_y = centroid_x, centroid_y
+            else:
+                caliber_x, caliber_y = centroid_x, centroid_y
 
             caliber_x = float(caliber_x)
             caliber_y = float(caliber_y)
@@ -339,14 +350,35 @@ class CVEngine:
                 primary_x, primary_y = caliber_x, caliber_y
                 selected_method = "caliber_fit"
 
-            # Step 7: Deduplicate candidate against existing shots list
+            # Step 7: Deduplicate candidate against existing shots list in millimeter space
             is_new = True
-            for shot in existing_shots:
-                dist = np.sqrt((primary_x - shot["x_raw"])**2 + (primary_y - shot["y_raw"])**2)
-                # If within threshold distance, this hole was already captured
-                if dist < self.proximity_threshold_px:
-                    is_new = False
-                    break
+            if transformer is not None:
+                try:
+                    primary_x_mm, primary_y_mm = transformer.raw_pixel_to_target_mm(primary_x, primary_y)
+                    proximity_threshold_mm = 3.0
+                    for shot in existing_shots:
+                        sx_mm = shot.get("x_calibrated")
+                        sy_mm = shot.get("y_calibrated")
+                        if sx_mm is None or sy_mm is None:
+                            sx_mm, sy_mm = transformer.raw_pixel_to_target_mm(shot["x_raw"], shot["y_raw"])
+                        
+                        dist_mm = np.sqrt((primary_x_mm - sx_mm)**2 + (primary_y_mm - sy_mm)**2)
+                        if dist_mm < proximity_threshold_mm:
+                            is_new = False
+                            break
+                except Exception as e:
+                    logger.warning(f"Millimeter deduplication failed, falling back to pixel deduplication: {e}")
+                    for shot in existing_shots:
+                        dist = np.sqrt((primary_x - shot["x_raw"])**2 + (primary_y - shot["y_raw"])**2)
+                        if dist < self.proximity_threshold_px:
+                            is_new = False
+                            break
+            else:
+                for shot in existing_shots:
+                    dist = np.sqrt((primary_x - shot["x_raw"])**2 + (primary_y - shot["y_raw"])**2)
+                    if dist < self.proximity_threshold_px:
+                        is_new = False
+                        break
 
             if is_new:
                 # Store contour as a flat coordinate list for serialization [[x1, y1], [x2, y2], ...]
